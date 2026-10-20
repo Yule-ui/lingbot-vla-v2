@@ -1415,12 +1415,15 @@ class FlowMatching(nn.Module):
             v_t = self.action_out_proj(suffix_out)
         return v_t
 
-    def depth_emb_forward(self, hidden_states, depth_targets=None, img_masks=None, future_depth_targets=None):
+    def _first_image_tokens(self, hidden_states):
         chunk_size = self.llm_image_token_size * self.llm_image_token_size
+        return hidden_states[:, 1 : chunk_size + 1, :]
+
+    def depth_emb_forward(self, hidden_states, depth_targets=None, img_masks=None, future_depth_targets=None):
         num_images = img_masks.shape[1] if img_masks is not None and img_masks.ndim == 2 else 3
         if img_masks is not None:
             img_masks = einops.rearrange(img_masks, 'b n -> (b n)')
-        image_embs = hidden_states[:, chunk_size * 0 + 1 : chunk_size * 1 + 1, :]
+        image_embs = self._first_image_tokens(hidden_states)
         align_embs = self._current_depth_task_tokens(hidden_states, num_images=num_images)
         align_embs = torch.cat([image_embs, align_embs], dim=1)
         depth_preds = self.depth_align_embs.repeat(align_embs.shape[0], 1, 1).to(dtype=align_embs.dtype, device=align_embs.device)
@@ -1461,8 +1464,7 @@ class FlowMatching(nn.Module):
 
         align_params = getattr(getattr(self, "config", None), "align_params", {}) or {}
         video_cfg = align_params.get("video", {}) if hasattr(align_params, "get") else {}
-        chunk_size = self.llm_image_token_size * self.llm_image_token_size
-        image_embs = hidden_states[:, chunk_size * 0 + 1 : chunk_size * 1 + 1, :]
+        image_embs = self._first_image_tokens(hidden_states)
         image_embs_for_video = image_embs.detach() if bool(video_cfg.get("detach_image_feats", False)) else image_embs
 
         cls_preds = None
@@ -1518,8 +1520,7 @@ class FlowMatching(nn.Module):
         if current_video_targets is None:
             raise ValueError("current_video_targets is required for current-video alignment.")
 
-        chunk_size = self.llm_image_token_size * self.llm_image_token_size
-        image_embs = hidden_states[:, chunk_size * 0 + 1 : chunk_size * 1 + 1, :]
+        image_embs = self._first_image_tokens(hidden_states)
         current_task_embs = self._current_depth_task_tokens(hidden_states)
         align_embs = torch.cat([image_embs, current_task_embs], dim=1)
         queries = self.current_video_align_embs.repeat(align_embs.shape[0], 1, 1).to(

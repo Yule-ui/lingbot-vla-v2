@@ -529,6 +529,8 @@ class FlowMatchingV2(FlowMatchingV1):
         )
         embed_dtype = img_emb.dtype
         num_patch = img_emb.shape[1]
+        # Auxiliary heads must use the actual grid rather than the old 8x8 grid.
+        self._image_patch_token_count = num_patch
         img_emb = einops.rearrange(img_emb, "(b n) l d -> b n l d", b=bsize, n=num_images)
         deepstack_embs = [
             einops.rearrange(x, "(b n) l d -> b n l d", b=bsize, n=num_images)
@@ -745,6 +747,11 @@ class FlowMatchingV2(FlowMatchingV1):
         suffix_1d = suffix_1d.masked_fill(~suffix_pad_masks, 1)
         suffix_position_ids = suffix_1d.unsqueeze(0).expand(3, -1, -1)
         return torch.cat([prefix_position_ids, suffix_position_ids], dim=-1)
+
+    def _first_image_tokens(self, hidden_states):
+        count = self._image_patch_token_count
+        start = 1 if getattr(self.config, 'qwen3vl_use_vision_boundaries', True) else 0
+        return hidden_states[:, start : start + count, :]
 
     def _current_depth_task_tokens(self, hidden_states, num_images=3):
         query_spans = prefix_query_token_spans(

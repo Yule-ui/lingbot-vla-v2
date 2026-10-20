@@ -31,6 +31,7 @@ from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.dist_utils import main_process_first
 from .vla_data import *
+from .vla_data.utils import resolve_image_size
 
 logger = logging.get_logger(__name__)
 
@@ -86,7 +87,7 @@ def build_vla_dataset(
     chunk_size = dataset_config.chunk_size
     prompt_type = dataset_config.prompt_type
     processor = processor if processor is not None and 'qwen' in model_config.tokenizer_path.lower() else None
-    img_size = getattr(dataset_config, 'img_size', 256)
+    image_size = resolve_image_size(dataset_config)
     image_augment = bool(getattr(dataset_config, "image_augment", False))
     use_future_image = getattr(dataset_config, 'use_future_image', False)
 
@@ -97,7 +98,7 @@ def build_vla_dataset(
             robot_config_root=robot_config_root,
             config=config,
             processor=processor,
-            image_size=(img_size, img_size),
+            image_size=image_size,
             chunk_size=chunk_size,
             disabled_image_features=disabled_image_features,
             prompt_type=prompt_type,
@@ -115,7 +116,7 @@ def build_vla_dataset(
             dataset_config=dataset_config,
             config=config,
             processor=processor,
-            image_size=(img_size, img_size),
+            image_size=image_size,
             do_nomalize=do_nomalize,
             return_item=return_item,
             chunk_size=chunk_size,

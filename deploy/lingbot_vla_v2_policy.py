@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import json
 import yaml
 from types import SimpleNamespace
 
@@ -29,7 +30,7 @@ from lingbotvla.models.vla.lingbot_vla.configuration_lingbot_vla import LingbotV
 from lingbotvla.models.vla.lingbot_vla.modeling_lingbot_vla_v2 import LingbotVlaV2Policy
 from lingbotvla.models.vla.lingbot_vla.qwen3vl_in_vla import apply_lingbot_qwen3_vl_patch
 
-from lingbotvla.data.vla_data.utils import FeatureTransform
+from lingbotvla.data.vla_data.utils import FeatureTransform, resolve_image_size
 from lingbotvla.models import build_processor
 import time
 import random
@@ -360,10 +361,16 @@ class LingbotVLAv2Server:
         # Load data processors
         self.vla.feature_transform = feature_transform
         self.action_key = feature_transform.org_features["actions"]
+        self._ur3_quaternion_reference = None
+        if robo_name == 'ur3_robotiq_eef_relative':
+            with open(self.robot_norm_path, 'r') as f:
+                preprocessing = json.load(f)['ur3_preprocessing']
+            self._ur3_quaternion_reference = torch.tensor(
+                preprocessing['state_quaternion_reference'], dtype=torch.float32)
+
     def resize_image(self, observation):
         image_features  = self.vla.feature_transform.org_features['images']
-        image_size = getattr(self.data_config, 'img_size', 256)
-        resize = Resize((image_size, image_size))
+        resize = Resize(resolve_image_size(self.data_config))
         for image_feature in image_features:
             assert image_feature in observation
             assert len(observation[image_feature].shape)==3 and observation[image_feature].shape[-1] == 3
@@ -401,6 +408,20 @@ class LingbotVLAv2Server:
     def _prepare_model_input(self, observation):
         # not modify input observation
         observation = dict(observation)
+        reference = getattr(self, '_ur3_quaternion_reference', None)
+        if reference is not None:
+            state = torch.as_tensor(observation['observation.state']).clone()
+            if state.shape != (17,):
+                raise ValueError('UR3 observation.state must have shape (17,)')
+            quaternion = state[12:16]
+            length = quaternion.norm()
+            if not torch.isfinite(quaternion).all() or length < 1e-8:
+                raise ValueError('Invalid UR3 observation quaternion')
+            quaternion = quaternion / length
+            if (quaternion * reference.to(quaternion)).sum() < 0:
+                quaternion = -quaternion
+            state[12:16] = quaternion
+            observation['observation.state'] = state
         self.resize_image(observation)
         for k, v in list(observation.items()):
             if isinstance(v, np.ndarray):
@@ -566,6 +587,13 @@ def main():
     )
 
     parser.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="WebSocket server listen address",
+    )
+
+    parser.add_argument(
         "--port",
         type=int,
         default=8006,
@@ -600,7 +628,7 @@ def main():
         use_fp32=args.use_fp32,
         use_compile=args.use_compile,
     )
-    model_server = WebsocketPolicyServer(model, port=args.port)
+    model_server = WebsocketPolicyServer(model, host=args.host, port=args.port)
     model_server.serve_forever()
 
 

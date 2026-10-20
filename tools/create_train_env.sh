@@ -138,7 +138,7 @@ assert_torch_stack
 
 python -m pip install -r "${REPO_ROOT}/requirements-depth.txt"
 assert_torch_stack
-# mlflow/depth dependencies can pull broad transitive requirements. Restore
+# Depth dependencies can pull broad transitive requirements. Restore
 # stableVLA's pinned core stack after resolving those runtime dependencies.
 python -m pip install -r "${REPO_ROOT}/requirements.txt"
 python -m pip install numpydantic==1.9.0 --no-deps
@@ -164,7 +164,6 @@ assert_torch_stack
 python - <<'PY'
 import cv2
 import accelerate
-import mlflow
 import trimesh
 import moge
 import mdm

@@ -19,6 +19,19 @@ import torch.nn.functional as F
 
 logger = logging_utils.get_logger(__name__)
 
+def resolve_image_size(data_config):
+    """Return torchvision's (height, width), preserving legacy square inputs."""
+    height = getattr(data_config, 'image_height', None)
+    width = getattr(data_config, 'image_width', None)
+    if (height is None) != (width is None):
+        raise ValueError('image_height and image_width must be specified together')
+    if height is None:
+        height = width = getattr(data_config, 'img_size', 256)
+    if int(height) <= 0 or int(width) <= 0:
+        raise ValueError('Image dimensions must be positive')
+    return int(height), int(width)
+
+
 def compute_image_token_count(images, image_grid_thw=None, merge_size=2, use_vision_boundaries=True):
     if not isinstance(images, torch.Tensor) or images.numel() == 0:
         return 0

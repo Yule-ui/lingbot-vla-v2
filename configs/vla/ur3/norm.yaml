@@ -1,0 +1,24 @@
+data:
+  datasets_type: vla
+  data_name: ur3_robotiq_eef_relative
+  train_path: /data-teamA/datasets/ur3_eef_relative
+  robot_config_root: /home/teamA/lingbot-vla-v2/configs/robot_configs
+  joints:
+  - arm.position: 14
+  - end.position: 14
+  - effector.position: 2
+  - waist.position: 4
+  - head.position: 2
+  - base.position: 3
+  - hand.position: 12
+  cameras:
+  - camera_top
+  - camera_wrist_left
+  - camera_wrist_right
+  num_workers: 2
+  norm_path: /home/teamA/lingbot-vla-v2/assets/norm_stats/ur3_robotiq_eef_relative.json
+train:
+  micro_batch_size: 128
+  chunk_size: 1
+  output_dir: ''
+  max_steps: 1

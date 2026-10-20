@@ -307,6 +307,8 @@ class MyDataArguments(DataArguments):
         default=256,
         metadata={"help": "Size of the image."},
     )
+    image_height: Optional[int] = field(default=None)
+    image_width: Optional[int] = field(default=None)
     norm_stats_file: str = field(
         default=None,
         metadata={"help": "Path to the normalization stats file."},

@@ -1,0 +1,4 @@
+# Keep the CUDA 12.6 wheels installed before resolving the training stack.
+torch==2.8.0+cu126
+torchvision==0.23.0+cu126
+torchaudio==2.8.0+cu126

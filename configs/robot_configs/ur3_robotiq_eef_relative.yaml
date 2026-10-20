@@ -1,0 +1,47 @@
+# Copy this file to LingBot-VLA 2.0's configs/robot_configs/ur3_robotiq_eef_relative.yaml.
+# It matches LeRobot recordings made with --robot.recording_action_mode=eef_relative
+# and --robot.reference_frame=base. Keep one reference frame throughout the dataset.
+# observation.state: six joints, TCP xyz, TCP rotvec, TCP quaternion xyzw, gripper.
+states:
+  - observation.state.arm.position:
+      origin_keys:
+        - observation.state:
+            start: 0
+            end: 6
+  - observation.state.end.position:
+      origin_keys:
+        - observation.state:
+            start: 6
+            end: 9
+        - observation.state:
+            start: 12
+            end: 16
+  - observation.state.effector.position:
+      origin_keys:
+        - observation.state:
+            start: 16
+            end: 17
+
+# action: relative translation in the base frame, local relative quaternion xyzw,
+# absolute gripper target. Do not subtract state again in the LingBot loader.
+actions:
+  - action.end.position:
+      origin_keys:
+        - action:
+            start: 0
+            end: 7
+      subtract_state: false
+  - action.effector.position:
+      origin_keys:
+        - action:
+            start: 7
+            end: 8
+      subtract_state: false
+
+images:
+  - observation.images.camera_top:
+      origin_keys: observation.images.camera_global
+  - observation.images.camera_wrist_left:
+      origin_keys: observation.images.camera_wrist
+
+norm_stats: assets/norm_stats/ur3_robotiq_eef_relative_20261016.json

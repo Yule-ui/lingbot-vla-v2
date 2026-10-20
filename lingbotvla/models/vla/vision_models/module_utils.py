@@ -423,7 +423,7 @@ def get_video_target(video_teacher, pil_images, future_pil_images, config, effec
         "current_patch": current_patch.detach().to(dtype=torch.bfloat16),
     }
 
-def get_depth_target(model_type, depth_model, pil_images):
+def get_depth_target(model_type, depth_model, pil_images, target_grid_size=16):
     if model_type != 'MoRGBD':
         raise ValueError(f"Only Lingbot-Depth depth targets are supported, got {model_type!r}.")
     pil_images = pil_images[:, :1, :, :, :]
@@ -441,6 +441,13 @@ def get_depth_target(model_type, depth_model, pil_images):
                                             resolution_level=3,
                                             num_tokens=256,
                                             enable_depth_mask=False)
+    # The teacher rounds its aspect-preserving grid (e.g. 14x18 for 4:3).
+    # The pretrained query head predicts a fixed 16x16 grid. Resample features
+    # spatially instead of truncating or flattening incompatible grids.
+    if depth_target.shape[-2:] != (target_grid_size, target_grid_size):
+        depth_target = F.interpolate(depth_target.float(),
+                                    size=(target_grid_size, target_grid_size),
+                                    mode='bilinear', align_corners=False)
     depth_target = depth_target.permute(0, 2, 3, 1)
     depth_target = depth_target.view(depth_target.shape[0], -1, depth_target.shape[-1])
 
