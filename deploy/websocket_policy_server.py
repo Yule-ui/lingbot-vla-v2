@@ -8,6 +8,7 @@ import traceback
 from .msgpack_numpy import Packer, unpackb
 import websockets.asyncio.server as _server
 import websockets.frames
+from websockets.extensions.permessage_deflate import ServerPerMessageDeflateFactory
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +36,19 @@ class WebsocketPolicyServer:
         asyncio.run(self.run())
 
     async def run(self):
+        compression = os.environ.get("WEBSOCKET_COMPRESSION", "none")
+        if compression not in ("none", "deflate"):
+            raise ValueError("WEBSOCKET_COMPRESSION must be none or deflate")
+        extensions = (
+            [ServerPerMessageDeflateFactory(compress_settings={"level": 1, "memLevel": 5})]
+            if compression == "deflate" else None
+        )
         async with _server.serve(
             self._handler,
             self._host,
             self._port,
             compression=None,
+            extensions=extensions,
             max_size=None,
             ping_interval=_optional_float_env("WEBSOCKET_PING_INTERVAL"),
             ping_timeout=_optional_float_env("WEBSOCKET_PING_TIMEOUT"),

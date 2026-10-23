@@ -274,7 +274,14 @@ class LingbotVLAv2Server:
         print(f"loading model from: {path_to_pi_model}")
         
         # load training config
-        training_config_path = Path(path_to_pi_model).parent.parent.parent/'lingbotvla_cli.yaml'
+        checkpoint_dir = Path(path_to_pi_model).resolve()
+        config_candidates = [
+            checkpoint_dir / 'lingbotvla_cli.yaml',
+            checkpoint_dir.parent.parent.parent / 'lingbotvla_cli.yaml',
+        ]
+        training_config_path = next((path for path in config_candidates if path.is_file()), None)
+        if training_config_path is None:
+            raise FileNotFoundError(f'No training configuration found for {checkpoint_dir}')
         with open(training_config_path, 'r') as f:
             training_config = yaml.safe_load(f)
         f.close()
@@ -331,7 +338,8 @@ class LingbotVLAv2Server:
             self.sample_actions_fn = torch.compile(self.vla.model.sample_actions)
 
         if self.robot_norm_path is None:
-            self.robot_norm_path = data_config.norm_stats_file
+            checkpoint_norm = checkpoint_dir / 'norm_stats.json'
+            self.robot_norm_path = str(checkpoint_norm) if checkpoint_norm.is_file() else data_config.norm_stats_file
 
         print('Model initialized ... ')
 
@@ -628,7 +636,15 @@ def main():
         use_fp32=args.use_fp32,
         use_compile=args.use_compile,
     )
-    model_server = WebsocketPolicyServer(model, host=args.host, port=args.port)
+    metadata = {
+        'model_path': str(Path(args.model_path).resolve()),
+        'norm_stats_path': str(model.robot_norm_path),
+        'chunk_length': args.use_length,
+        'use_bf16': args.use_bf16,
+        'use_compile': args.use_compile,
+        'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
+    }
+    model_server = WebsocketPolicyServer(model, host=args.host, port=args.port, metadata=metadata)
     model_server.serve_forever()
 
 
