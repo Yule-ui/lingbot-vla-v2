@@ -271,10 +271,13 @@ class LingbotVLAv2Server:
             print("⚠️ Warning: 'vision_config' not found in qwen_config!")
 
     def load_vla(self, path_to_pi_model) -> LingbotVlaV2Policy:
+        self.path_to_pi_model = path_to_pi_model
         print(f"loading model from: {path_to_pi_model}")
         
         # load training config
-        training_config_path = Path(path_to_pi_model).parent.parent.parent/'lingbotvla_cli.yaml'
+        training_config_path = Path(path_to_pi_model) / 'lingbotvla_cli.yaml'
+        if not training_config_path.is_file():
+            training_config_path = Path(path_to_pi_model).parent.parent.parent / 'lingbotvla_cli.yaml'
         with open(training_config_path, 'r') as f:
             training_config = yaml.safe_load(f)
         f.close()
@@ -296,7 +299,9 @@ class LingbotVLAv2Server:
             model_name = 'qwen3vl'
         else: 
             raise ValueError(f"Unsupported base model of {path_to_pi_model}")
-        base_model_path = os.environ.get('QWEN3VL_PATH', training_base_model) or BASE_MODEL_PATH[model_name]
+        bundled_qwen = Path(path_to_pi_model) / 'qwen3vl_assets'
+        default_qwen = str(bundled_qwen) if (bundled_qwen / 'config.json').is_file() else training_base_model
+        base_model_path = os.environ.get('QWEN3VL_PATH') or default_qwen or BASE_MODEL_PATH[model_name]
         config.tokenizer_path = base_model_path
         self.model_name = model_name
         
@@ -331,7 +336,8 @@ class LingbotVLAv2Server:
             self.sample_actions_fn = torch.compile(self.vla.model.sample_actions)
 
         if self.robot_norm_path is None:
-            self.robot_norm_path = data_config.norm_stats_file
+            bundled_norm = Path(path_to_pi_model) / 'norm_stats.json'
+            self.robot_norm_path = str(bundled_norm) if bundled_norm.is_file() else data_config.norm_stats_file
 
         print('Model initialized ... ')
 
@@ -351,7 +357,8 @@ class LingbotVLAv2Server:
         self.last_action_chunk = None
         self.last_normalized_action_chunk = None
 
-        robot_config = f'configs/robot_configs/{robo_name}.yaml'
+        bundled_robot_config = Path(self.path_to_pi_model) / 'robot_config.yaml'
+        robot_config = str(bundled_robot_config) if bundled_robot_config.is_file() else f'configs/robot_configs/{robo_name}.yaml'
         
         with open(robot_config, 'r') as f:
           self.robot_config = yaml.safe_load(f)

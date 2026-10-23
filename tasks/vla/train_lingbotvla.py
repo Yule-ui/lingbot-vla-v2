@@ -1,6 +1,8 @@
 import json
 import os
+import random
 import re
+import shutil
 import time
 from dataclasses import asdict, dataclass, field
 from functools import partial
@@ -16,6 +18,7 @@ from tqdm import trange
 from torch.utils.tensorboard import SummaryWriter
 from lingbotvla.utils.async_tb_writer import AsyncTBWriter
 from lingbotvla.checkpoint import build_checkpointer
+from lingbotvla.checkpoint.retention import completed_dcp_candidates, mark_dcp_complete, prune_older_dcp
 from lingbotvla.data import (
     OmniDataCollatorWithPacking,
     OmniDataCollatorWithPadding,
@@ -36,6 +39,8 @@ from lingbotvla.utils import helper
 from lingbotvla.utils.async_hf_checkpoint import AsyncHFCheckpointSaver
 from lingbotvla.utils.arguments import EvalArguments, DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from lingbotvla.utils.dist_utils import all_reduce
+from lingbotvla.utils.shared_training_output import verify_shared_training_output
+from lingbotvla.utils.training_benchmark import summarize_training_benchmark
 from lingbotvla.models.config_registry import get_config_registry
 
 from lingbotvla.models.vla.vision_models.module_utils import (
@@ -334,16 +339,86 @@ class Arguments:
 
 def main():
     args = parse_args(Arguments)
+    benchmark_steps = int(os.environ.get("LINGBOT_BENCHMARK_STEPS", "0"))
+    if benchmark_steps < 0 or (benchmark_steps and (
+            args.train.max_steps is None or benchmark_steps >= args.train.max_steps
+            or args.train.enable_resume or args.train.load_checkpoint_path)):
+        raise ValueError("Benchmark steps must be below max_steps and run from fresh weights without resume")
+    benchmark_step_times = []
+    hf_export_raw = os.environ.get("LINGBOT_HF_EXPORT_STEPS", "").strip()
+    hf_export_steps = tuple(int(part.strip()) for part in hf_export_raw.split(",")) if hf_export_raw else ()
+    dcp_keep_last = int(os.environ.get("LINGBOT_DCP_KEEP_LAST", "0"))
+    rolling_dcp = bool(hf_export_steps or dcp_keep_last)
+    hf_only_raw = os.environ.get("LINGBOT_HF_ONLY_STEPS", "").strip()
+    hf_only_steps = tuple(int(part.strip()) for part in hf_only_raw.split(",")) if hf_only_raw else ()
+    if rolling_dcp:
+        if hf_only_steps or dcp_keep_last != 1 or not hf_export_steps:
+            raise ValueError("Rolling DCP requires LINGBOT_DCP_KEEP_LAST=1 and LINGBOT_HF_EXPORT_STEPS; disable HF-only mode")
+        if (any(step <= 0 for step in hf_export_steps)
+                or tuple(sorted(set(hf_export_steps))) != hf_export_steps
+                or hf_export_steps[-1] != args.train.max_steps):
+            raise ValueError("HF export steps must be sorted, unique, positive and end at train.max_steps")
+        if (args.train.ckpt_manager != "dcp" or args.train.save_epochs
+                or not args.train.save_steps or args.train.save_steps < 0
+                or not args.train.save_hf_weights or args.train.async_save_hf_weights):
+            raise ValueError("Rolling DCP requires DCP, save_steps>0, save_epochs=0 and synchronous HF export")
+        if any(step % args.train.save_steps for step in hf_export_steps):
+            raise ValueError("Each HF export step must coincide with a DCP save step")
+    if hf_only_steps:
+        if (any(step <= 0 for step in hf_only_steps)
+                or tuple(sorted(set(hf_only_steps))) != hf_only_steps):
+            raise ValueError("LINGBOT_HF_ONLY_STEPS must be sorted, unique, positive step numbers")
+        if args.train.max_steps != hf_only_steps[-1]:
+            raise ValueError("The final HF-only save step must equal train.max_steps")
+        if (args.train.save_steps or args.train.save_epochs
+                or not args.train.save_hf_weights or args.train.async_save_hf_weights):
+            raise ValueError("HF-only saves require save_steps=0, save_epochs=0, synchronous HF export")
+        if args.train.enable_resume or args.train.load_checkpoint_path:
+            raise ValueError("HF-only weights cannot resume optimizer or scheduler state")
+        if args.train.ckpt_manager != "dcp":
+            raise ValueError("HF-only export requires the DCP model staging format")
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
+    logger.info_rank0("NCCL transport environment: " + json.dumps({key: os.environ.get(key) for key in (
+        "NCCL_P2P_DISABLE", "NCCL_SHM_DISABLE", "NCCL_IB_DISABLE", "NCCL_SOCKET_IFNAME")}))
+    if benchmark_steps:
+        logger.info_rank0(f"Isolated benchmark: {benchmark_steps} updates, LR schedule max_steps={args.train.max_steps}, no DCP/HF saves")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     torch.cuda.set_device(f"cuda:{args.train.local_rank}")
     dist.init_process_group(backend="nccl")
+    if int(os.environ.get("LOCAL_WORLD_SIZE", args.train.world_size)) < args.train.world_size:
+        verify_shared_training_output(args.train.output_dir, {
+            "max_steps": args.train.max_steps,
+            "micro_batch_size": args.train.micro_batch_size,
+            "global_batch_size": args.train.global_batch_size,
+            "gradient_accumulation_steps": args.train.gradient_accumulation_steps,
+            "lr": args.train.lr,
+            "lr_min": args.train.lr_min,
+            "lr_decay_style": args.train.lr_decay_style,
+            "lr_warmup_ratio": args.train.lr_warmup_ratio,
+            "optimizer": args.train.optimizer,
+            "weight_decay": args.train.weight_decay,
+            "image_size": (args.data.image_width, args.data.image_height),
+            "model_path": args.model.model_path,
+            "train_path": args.data.train_path,
+            "norm_stats_file": args.data.norm_stats_file,
+            "save_steps": args.train.save_steps,
+            "hf_export_steps": hf_export_steps,
+            "dcp_keep_last": dcp_keep_last,
+            "benchmark_steps": benchmark_steps,
+            "enable_resume": args.train.enable_resume,
+            "load_checkpoint_path": args.train.load_checkpoint_path,
+        })
+        logger.info_rank0("Shared output and cross-node training settings verified")
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
 
     if args.train.global_rank == 0:
         save_args(args, args.train.output_dir)
+        if rolling_dcp:
+            with open(os.path.join(args.train.output_dir, "checkpoint_policy.json"), "w") as stream:
+                json.dump({"hf_export_steps": hf_export_steps, "dcp_save_steps": args.train.save_steps,
+                           "dcp_keep_last": dcp_keep_last, "benchmark_steps": benchmark_steps}, stream, indent=2)
 
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
 
@@ -630,6 +705,94 @@ def main():
             epoch_step=epoch_step,
         )
 
+    def package_hf_assets(checkpoint_path: str) -> None:
+        """Include the UR3 configuration and processor files needed by inference."""
+        hf_path = os.path.join(checkpoint_path, "hf_ckpt")
+        if (not os.path.isfile(os.path.join(hf_path, "model.safetensors.index.json"))
+                or not os.path.isfile(os.path.join(hf_path, "config.json"))):
+            raise RuntimeError(f"Incomplete HF checkpoint at {hf_path}")
+        shutil.copy2(os.path.join(args.train.output_dir, "lingbotvla_cli.yaml"),
+                     os.path.join(hf_path, "lingbotvla_cli.yaml"))
+        shutil.copy2(args.data.norm_stats_file, os.path.join(hf_path, "norm_stats.json"))
+        robot_config_path = os.path.join(args.data.robot_config_root, f"{args.data.data_name}.yaml")
+        shutil.copy2(robot_config_path, os.path.join(hf_path, "robot_config.yaml"))
+        shutil.copytree(
+            args.model.tokenizer_path,
+            os.path.join(hf_path, "qwen3vl_assets"),
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns(
+                ".cache", "*.safetensors", "*.bin", "*.pt", "model.safetensors.index.json"
+            ),
+        )
+
+    def save_hf_only(step: int, epoch: int, epoch_step: int) -> None:
+        """Stage a model-only DCP, export HF, then remove the staging weights."""
+        helper.empty_cache()
+        checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{step}")
+        state = {"model": model, "ema": None}
+        Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=step)
+        dist.barrier()
+        error = None
+        if args.train.global_rank == 0:
+            try:
+                save_hf_checkpoint_best_effort(checkpoint_path, state, step, epoch, epoch_step)
+                hf_path = os.path.join(checkpoint_path, "hf_ckpt")
+                package_hf_assets(checkpoint_path)
+                shutil.rmtree(os.path.join(checkpoint_path, "model"))
+                logger.info_rank0(f"HF-only inference checkpoint saved at {hf_path}")
+            except Exception as exc:
+                error = repr(exc)
+        errors = [error]
+        dist.broadcast_object_list(errors, src=0)
+        if errors[0] is not None:
+            raise RuntimeError(f"HF-only export failed at step {step}; staged model retained: {errors[0]}")
+        dist.barrier()
+
+    def finalize_rolling_checkpoint(checkpoint_path: str, step: int, epoch: int, epoch_step: int) -> None:
+        """All ranks wait while rank zero commits, rotates and exports the save."""
+        error = None
+        if args.train.global_rank == 0:
+            try:
+                mark_dcp_complete(checkpoint_path, step, args.train.world_size)
+                prune_older_dcp(args.train.save_checkpoint_path, step)
+                if step in hf_export_steps:
+                    save_hf_checkpoint_best_effort(checkpoint_path, {"ema": None}, step, epoch, epoch_step)
+                    package_hf_assets(checkpoint_path)
+            except Exception as exc:
+                error = repr(exc)
+        errors = [error]
+        dist.broadcast_object_list(errors, src=0)
+        if errors[0] is not None:
+            raise RuntimeError(f"Checkpoint finalization failed at step {step}: {errors[0]}")
+        dist.barrier()
+
+    def save_rolling_checkpoint(step: int, epoch: int, epoch_step: int) -> str:
+        helper.empty_cache()
+        checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{step}")
+        numpy_rng = np.random.get_state()
+        state = {
+            "model": model,
+            "ema": None,
+            "optimizer": optimizer,
+            "extra_state": {
+                "global_step": step,
+                "lr_scheduler": lr_scheduler.state_dict(),
+                "train_dataloader": train_dataloader.state_dict(),
+                "environ_meter": environ_meter.state_dict(),
+                "torch_rng_state": torch.get_rng_state(),
+                "cuda_rng_state": torch.cuda.get_rng_state(),
+                "python_rng_state": random.getstate(),
+                "numpy_rng_state": (numpy_rng[0], numpy_rng[1].tolist(), *numpy_rng[2:]),
+            },
+        }
+        if args.train.global_rank == 0:
+            writer.flush()
+        Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=step)
+        dist.barrier()
+        finalize_rolling_checkpoint(checkpoint_path, step, epoch, epoch_step)
+        logger.info_rank0(f"Complete DCP saved at {checkpoint_path}; older DCP states removed, HF exports retained")
+        return checkpoint_path
+
     environ_meter = helper.EnvironMeter(
         config=model_config,
         global_batch_size=args.train.global_batch_size,
@@ -646,7 +809,12 @@ def main():
             candidates = [load_checkpoint_path]
         elif args.train.enable_resume:
             checkpoint_dir = f'{args.train.output_dir}/checkpoints'
-            if os.path.exists(checkpoint_dir):
+            if rolling_dcp:
+                candidates = completed_dcp_candidates(checkpoint_dir, args.train.world_size)
+                if (not candidates and os.path.isdir(checkpoint_dir)
+                        and any(re.fullmatch(r"global_step_\d+", name) for name in os.listdir(checkpoint_dir))):
+                    raise RuntimeError("No committed DCP for this world size; refusing to restart an existing run from scratch")
+            elif os.path.exists(checkpoint_dir):
                 pattern = re.compile(r"global_step_(\d+)")
                 tmp = []
                 for dirname in os.listdir(checkpoint_dir):
@@ -674,14 +842,21 @@ def main():
                 if start_step > 0 and args.train.resume_dataloader_state:
                     train_dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
                 environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
-                torch.set_rng_state(state["extra_state"]["torch_rng_state"])
                 if start_step == 0:  # resume at the end of epoch
                     iter(train_dataloader)  # clear resume state and prefetch data
+                torch.set_rng_state(state["extra_state"]["torch_rng_state"])
+                if "cuda_rng_state" in state["extra_state"]:
+                    torch.cuda.set_rng_state(state["extra_state"]["cuda_rng_state"])
+                    random.setstate(state["extra_state"]["python_rng_state"])
+                    numpy_rng = state["extra_state"]["numpy_rng_state"]
+                    np.random.set_state((numpy_rng[0], np.array(numpy_rng[1], dtype=np.uint32), *numpy_rng[2:]))
                 dist.barrier()
                 logger.info_rank0(f"Load distributed checkpoint from {cp} successfully!")
                 loaded = True
                 break
             except Exception as e:
+                if os.environ.get("LINGBOT_STRICT_OPTIMIZER_RESUME") == "1":
+                    raise RuntimeError(f"Full-tune checkpoint restore failed at {cp}: {e!r}") from e
                 last_err = e
                 logger.info_rank0(f"Failed to load checkpoint {cp}: {repr(e)}. Trying older one...")
                 continue
@@ -689,6 +864,17 @@ def main():
             logger.info_rank0("Starting training from scratch. No valid checkpoint could be loaded.")
     else:
         logger.info_rank0("Starting training from scratch.")
+
+    if rolling_dcp and global_step:
+        # Also repairs an interrupted HF export at a saved milestone before training continues.
+        finalize_rolling_checkpoint(cp, global_step, start_epoch + 1, start_step)
+        if global_step >= args.train.max_steps:
+            logger.info_rank0(f"Checkpoint already reached max_steps={args.train.max_steps}; no further updates")
+            hf_saver.wait_all_across_ranks()
+            if args.train.global_rank == 0:
+                writer.close()
+            dist.destroy_process_group()
+            return
 
     helper.empty_cache()
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
@@ -702,6 +888,7 @@ def main():
     if args.train.global_rank == 0:
         os.makedirs(args.train.save_checkpoint_path, exist_ok=True)
     reached_max_steps = False
+    reached_benchmark_steps = False
     max_steps_driven = (
         args.train.max_steps is not None
         and args.train.max_steps < args.train.train_steps * args.train.num_train_epochs
@@ -904,6 +1091,8 @@ def main():
             total_future_video_loss = total_future_video_loss / future_video_loss_weight
             torch.cuda.synchronize()
             delta_time = time.time() - start_time
+            if benchmark_steps:
+                benchmark_step_times.append(delta_time)
             all_lrs = lr_scheduler.get_last_lr()
             if args.train.use_moe_expert_lr and len(all_lrs) > 1:
                 lr = min(all_lrs)          # base (non-expert) lr
@@ -934,12 +1123,16 @@ def main():
                 f"LR {lr:.2e}, "
                 f"{expert_lr_str}"
                 f"StepTime {delta_time:.3f}s, "
+                f"PeakAllocated {train_metrics['max_memory_allocated(GB)']:.2f}GiB, "
+                f"PeakReserved {train_metrics['max_memory_reserved(GB)']:.2f}GiB, "
                 f"Depth_Forward_Time {depth_forward_time: .3f}s, "
                 f"Ignore_Batch_Num {ignore_batch_num}"
             )
 
 
             if args.train.global_rank == 0:
+                for metric_name, metric_value in train_metrics.items():
+                    writer.add_scalar(f"performance/{metric_name}", metric_value, global_step)
                 writer.add_scalar("training/loss", total_loss, global_step)
                 writer.add_scalar("training/vla_loss", total_vla_loss, global_step)
                 writer.add_scalar("training/depth_loss", total_depth_loss, global_step)
@@ -1084,7 +1277,19 @@ def main():
                                     current_pred_feats=future_video_current_preds,
                                 )
 
-            if args.train.save_steps and global_step % args.train.save_steps == 0:
+            if benchmark_steps and global_step >= benchmark_steps:
+                logger.info_rank0(f"Benchmark completed {global_step} optimizer updates; skipping DCP/HF saves")
+                reached_benchmark_steps = True
+                break
+
+            if not benchmark_steps and hf_only_steps and global_step in hf_only_steps:
+                save_hf_only(global_step, current_epoch_for_eval, current_epoch_step_for_eval)
+
+            if not benchmark_steps and rolling_dcp and global_step % args.train.save_steps == 0:
+                save_checkpoint_path = save_rolling_checkpoint(
+                    global_step, current_epoch_for_eval, current_epoch_step_for_eval)
+
+            if not benchmark_steps and not hf_only_steps and not rolling_dcp and args.train.save_steps and global_step % args.train.save_steps == 0:
                 helper.empty_cache()
                 save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
                 
@@ -1134,7 +1339,11 @@ def main():
             writer.flush()
         start_step = 0
         helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+        if reached_benchmark_steps:
+            break
         if reached_max_steps:
+            if hf_only_steps or rolling_dcp:
+                break
             already_saved = args.train.save_steps and global_step % args.train.save_steps == 0
             if not already_saved:
                 helper.empty_cache()
@@ -1162,7 +1371,7 @@ def main():
                     current_epoch_step_for_eval,
                 )
             break
-        if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
+        if not benchmark_steps and not hf_only_steps and not rolling_dcp and args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
             helper.empty_cache()
             save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
             state = {
@@ -1190,6 +1399,25 @@ def main():
 
     if max_steps_driven:
         data_loader_tqdm.close()
+    if benchmark_steps:
+        if not reached_benchmark_steps:
+            raise RuntimeError("Benchmark ended before the requested optimizer updates completed")
+        if args.train.global_rank == 0:
+            summary = summarize_training_benchmark(benchmark_step_times, args.train.global_batch_size)
+            summary.update({
+                "global_batch_size": args.train.global_batch_size,
+                "image_width": args.data.image_width,
+                "image_height": args.data.image_height,
+                "lr_schedule_max_steps": args.train.max_steps,
+                "peak_allocated_gib": train_metrics["max_memory_allocated(GB)"],
+                "peak_reserved_gib": train_metrics["max_memory_reserved(GB)"],
+                "nccl_environment": {key: os.environ.get(key) for key in (
+                    "NCCL_P2P_DISABLE", "NCCL_SHM_DISABLE", "NCCL_IB_DISABLE", "NCCL_SOCKET_IFNAME")},
+            })
+            summary_path = os.path.join(args.train.output_dir, "benchmark_summary.json")
+            with open(summary_path, "w") as stream:
+                json.dump(summary, stream, indent=2)
+            logger.info_rank0(f"Benchmark summary saved at {summary_path}: {json.dumps(summary)}")
     if args.train.global_rank == 0:
         writer.close()
     torch.cuda.synchronize()
@@ -1197,7 +1425,7 @@ def main():
     del optimizer, lr_scheduler
     helper.empty_cache()
     # Ensure the last checkpoint has an HF conversion scheduled, then wait for async work.
-    if save_checkpoint_path is not None:
+    if save_checkpoint_path is not None and not rolling_dcp and not benchmark_steps:
         save_hf_checkpoint_best_effort(
             save_checkpoint_path,
             state,

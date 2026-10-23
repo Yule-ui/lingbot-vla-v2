@@ -20,6 +20,8 @@ def main():
     parser.add_argument('--preflight-only', action='store_true', help='Check four-rank model loading without training')
     parser.add_argument('--vlm-train-last-layers', type=int, default=0,
                         help='UR3 partial VLM finetuning; 0 preserves the frozen-VLM strategy')
+    parser.add_argument('--full-tune', action='store_true',
+                        help='Train the Qwen vision/language backbone and action model together')
     options, remaining = parser.parse_known_args()
     split = options.split or ('validation' if options.stage == 'eval' else 'train')
     manifest = install_data_adapters(options.manifest, split)
@@ -45,7 +47,8 @@ def main():
             raise ValueError('Training requires the training split')
         trainer = importlib.import_module('tasks.vla.train_lingbotvla')
         captured = install_training_adapter(trainer, preflight_only=options.preflight_only,
-                                            vlm_train_last_layers=options.vlm_train_last_layers)
+                                            vlm_train_last_layers=options.vlm_train_last_layers,
+                                            full_tune=options.full_tune)
         try:
             trainer.main()
             import torch

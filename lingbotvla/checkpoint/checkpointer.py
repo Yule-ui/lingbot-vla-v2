@@ -441,8 +441,10 @@ class DistributedCheckpointer(CheckpointerBase):
                     planner = DefaultLoadPlanner(allow_partial_load=True),
                     process_group=process_group,
                 )
-            except:
-                logger.info_rank0(f"Skip loading Optimizer from {checkpoint_dir}")
+            except Exception as exc:
+                if os.environ.get("LINGBOT_STRICT_OPTIMIZER_RESUME") == "1":
+                    raise RuntimeError(f"Could not restore optimizer from {checkpoint_dir}: {exc!r}") from exc
+                logger.info_rank0(f"Skip loading Optimizer from {checkpoint_dir}: {exc!r}")
         else:
             model_dir = os.path.join(checkpoint_dir, _MODEL_DIR)
             dcp.load(

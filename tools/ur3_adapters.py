@@ -87,18 +87,21 @@ def install_data_adapters(manifest_path, split):
     return manifest
 
 
-def install_training_adapter(trainer, preflight_only=False, vlm_train_last_layers=0):
+def install_training_adapter(trainer, preflight_only=False, vlm_train_last_layers=0, full_tune=False):
     import torch
     import torch.distributed as dist
     from safetensors import safe_open
     from lingbotvla.distributed import torch_parallelize
 
     original_parse = trainer.parse_args
+    original_optimizer = trainer.build_optimizer
     original_parallelize = trainer.build_parallelize_model
     original_load = torch_parallelize.load_model_weights
     captured = {}
     if not 0 <= vlm_train_last_layers <= 36:
         raise ValueError('vlm_train_last_layers must be between 0 and 36')
+    if full_tune and vlm_train_last_layers:
+        raise ValueError('Choose either full_tune or vlm_train_last_layers')
 
     @functools.wraps(original_parse)
     def parse(*args, **kwargs):
@@ -107,6 +110,11 @@ def install_training_adapter(trainer, preflight_only=False, vlm_train_last_layer
             raise ValueError('UR3 wrapper requires meta initialization and post_training=true')
         if result.model.vlm_repo_id:
             raise ValueError('Load the complete LingBot checkpoint, not separate VLM weights')
+        if full_tune:
+            result.train.train_expert_only = False
+            result.train.freeze_vision_encoder = False
+            result.train.freeze_vit = False
+            result.train.use_moe_expert_lr = False
         if vlm_train_last_layers:
             result.train.train_expert_only = False
             result.train.freeze_vision_encoder = True
@@ -165,18 +173,22 @@ def install_training_adapter(trainer, preflight_only=False, vlm_train_last_layer
         first_trainable_layer = len(qwen.model.language_model.layers) - vlm_train_last_layers
         for name, parameter in qwen.named_parameters():
             pieces = name.split('.')
-            expected_trainable = (
+            expected_trainable = full_tune or (
                 vlm_train_last_layers > 0
                 and name.startswith('model.language_model.layers.')
                 and int(pieces[3]) >= first_trainable_layer
             )
             if parameter.requires_grad != expected_trainable:
                 raise RuntimeError(f'Unexpected Qwen freeze state: {name}')
+        if full_tune and not all(p.requires_grad for p in qwen.visual.parameters()):
+            raise RuntimeError('Vision encoder is not fully trainable')
         assert model.model.state_proj.weight.requires_grad
         audit = {'rank': dist.get_rank(), 'checkpoint': config.model.model_path,
-                 'sampled_parameters_match': checked, 'qwen_frozen': vlm_train_last_layers == 0,
+                 'sampled_parameters_match': checked, 'qwen_frozen': not full_tune and vlm_train_last_layers == 0,
+                 'full_tune': full_tune,
                  'vlm_train_last_layers': vlm_train_last_layers,
                  'trainable_parameters': sum(p.numel() for p in model.parameters() if p.requires_grad),
+                 'total_parameters': sum(p.numel() for p in model.parameters()),
                  'peak_allocated_GiB': torch.cuda.max_memory_allocated() / 1024**3}
         output = Path(config.train.output_dir)
         output.mkdir(parents=True, exist_ok=True)
@@ -189,15 +201,26 @@ def install_training_adapter(trainer, preflight_only=False, vlm_train_last_layer
 
     trainer.parse_args = parse
     trainer.build_parallelize_model = parallelize
+    if full_tune:
+        @functools.wraps(original_optimizer)
+        def memory_efficient_adamw(*args, **kwargs):
+            optimizer = original_optimizer(*args, **kwargs)
+            for group in optimizer.param_groups:
+                group['foreach'] = False
+                if kwargs.get('optimizer_type') == 'anyprecision_adamw':
+                    # Master parameters are FP32; skip the BF16 compensation buffer.
+                    group['use_kahan_summation'] = False
+            return optimizer
+        trainer.build_optimizer = memory_efficient_adamw
     torch_parallelize.load_model_weights = strict_load
-    if vlm_train_last_layers:
+    if vlm_train_last_layers or full_tune:
         def partial_vlm_param_groups(model, args_train):
             # Explicit LRs; do not apply the routed-expert sqrt(32/4) multiplier.
             groups = {}
             for name, parameter in model.named_parameters():
                 if not parameter.requires_grad:
                     continue
-                if '.qwenvl.model.language_model.' in name:
+                if '.qwenvl.' in name:
                     lr = 1e-6
                 elif '.qwen_expert.' in name:
                     lr = 1e-5

@@ -32,7 +32,8 @@ POLICY_MODULES = {
 
 
 def _get_training_config_path(model_path: str) -> Path:
-    return Path(model_path).parent.parent.parent / "lingbotvla_cli.yaml"
+    bundled = Path(model_path) / "lingbotvla_cli.yaml"
+    return bundled if bundled.is_file() else Path(model_path).parent.parent.parent / "lingbotvla_cli.yaml"
 
 
 def resolve_policy_module(policy: str, model_path: str) -> str:
